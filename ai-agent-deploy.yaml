@@ -1,0 +1,164 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-inference-agent
+  namespace: ai-workloads
+  labels:
+    app: ai-inference-agent
+    servicenow.com/agent-type: llm-inference
+    servicenow.com/governed: "true"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ai-inference-agent
+  template:
+    metadata:
+      labels:
+        app: ai-inference-agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8001"
+        prometheus.io/path: "/metrics"
+    spec:
+      nodeSelector:
+        role: ai-workload
+      containers:
+      - name: ai-agent
+        image: kennethreitz/httpbin
+        ports:
+        - containerPort: 8000
+        env:
+        - name: MODEL_NAME
+          value: "llama3-70b-sim"
+        - name: GPU_SIM_UTILIZATION
+          value: "0.78"
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+      - name: metrics-sim
+        image: python:3.11-slim
+        command: ["sh", "-c"]
+        args:
+          - |
+            pip install prometheus_client opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc opentelemetry-api --quiet && python3 - <<'PYEOF'
+            from prometheus_client import start_http_server, Gauge, Counter
+            from opentelemetry import trace
+            from opentelemetry.sdk.trace import TracerProvider
+            from opentelemetry.sdk.trace.export import BatchSpanProcessor
+            from opentelemetry.sdk.resources import Resource
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+            import time, math, random
+
+            # OpenTelemetry / OpenLLMetry setup
+            resource = Resource.create({
+                "service.name": "ai-inference-agent",
+                "service.version": "1.0.0",
+                "ai.model.name": "llama3-70b-sim",
+                "ai.model.provider": "nvidia-sim",
+                "k8s.namespace": "ai-workloads",
+            })
+            provider = TracerProvider(resource=resource)
+            try:
+                exporter = OTLPSpanExporter(endpoint="http://otel-collector.monitoring.svc:4317", insecure=True)
+                provider.add_span_processor(BatchSpanProcessor(exporter))
+            except Exception:
+                pass
+            trace.set_tracer_provider(provider)
+            tracer = trace.get_tracer("ai-inference-agent")
+
+            # Prometheus metrics
+            gpu = Gauge('DCGM_FI_DEV_GPU_UTIL', 'GPU utilization')
+            req = Counter('ai_agent_requests_total', 'Total requests')
+            lat = Gauge('ai_agent_latency_seconds', 'Latency')
+            tput = Gauge('ai_agent_token_throughput', 'Token throughput')
+            token_in = Counter('ai_agent_input_tokens_total', 'Input tokens processed')
+            token_out = Counter('ai_agent_output_tokens_total', 'Output tokens generated')
+            start_http_server(8001)
+
+            # Simulation pattern:
+            # - Normal phase (5 min): healthy metrics, no alerts
+            # - Stress phase (15 min): GPU > 85%, latency > 0.16s, throughput < 300 - multiple alerts fire
+            # - Recovery phase (10 min): metrics recovering
+            # - Repeat
+            CYCLE = 360   # total cycle length in ticks (each tick = 5s) = 30 min cycle
+            NORMAL_END = 60    # ticks 0-59 = normal (5 min)
+            STRESS_END = 240   # ticks 60-239 = stress (15 min)
+            # ticks 240-359 = recovery (10 min)
+
+            t = 0
+            while True:
+                phase = t % CYCLE
+
+                if phase < NORMAL_END:
+                    # Normal operation
+                    gpu_val = 65 + 10 * math.sin(t / 20) + random.uniform(-3, 3)
+                    lat_val = 0.10 + random.uniform(0, 0.02)
+                    tput_val = 480 + random.uniform(-30, 30)
+                    req_inc = random.randint(3, 7)
+                elif phase < STRESS_END:
+                    # Stress phase - sustained high GPU, high latency, low throughput
+                    stress_t = phase - NORMAL_END
+                    gpu_val = 88 + 5 * math.sin(stress_t / 5) + random.uniform(-2, 2)
+                    lat_val = 0.17 + random.uniform(0, 0.04)
+                    tput_val = 280 + random.uniform(-30, 20)
+                    req_inc = random.randint(8, 15)  # high load
+                else:
+                    # Recovery phase
+                    recovery_t = phase - STRESS_END
+                    recovery_pct = recovery_t / (CYCLE - STRESS_END)
+                    gpu_val = 88 - (23 * recovery_pct) + random.uniform(-3, 3)
+                    lat_val = 0.17 - (0.07 * recovery_pct) + random.uniform(0, 0.01)
+                    tput_val = 280 + (200 * recovery_pct) + random.uniform(-20, 20)
+                    req_inc = random.randint(3, 8)
+
+                in_tokens = random.randint(100, 500)
+                out_tokens = random.randint(50, 200)
+
+                with tracer.start_as_current_span("llm.completion") as span:
+                    span.set_attribute("llm.model", "llama3-70b-sim")
+                    span.set_attribute("llm.input_tokens", in_tokens)
+                    span.set_attribute("llm.output_tokens", out_tokens)
+                    span.set_attribute("llm.latency_seconds", lat_val)
+                    span.set_attribute("llm.provider", "nvidia-sim")
+                    span.set_attribute("sim.phase", "normal" if phase < NORMAL_END else "stress" if phase < STRESS_END else "recovery")
+
+                    gpu.set(max(0, min(100, gpu_val)))
+                    req.inc(req_inc)
+                    lat.set(max(0.05, lat_val))
+                    tput.set(max(50, tput_val))
+                    token_in.inc(in_tokens * req_inc)
+                    token_out.inc(out_tokens * req_inc)
+
+                t += 1
+                time.sleep(5)
+            PYEOF
+        ports:
+        - containerPort: 8001
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-inference-agent
+  namespace: ai-workloads
+spec:
+  selector:
+    app: ai-inference-agent
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+  - name: metrics
+    port: 8001
+    targetPort: 8001
